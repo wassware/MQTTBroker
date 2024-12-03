@@ -1,20 +1,24 @@
 // Mqtt broker for local network.
-// Also has Serial2 link to hive mqtt bridge.
 // Sits on internal framework code with a few hacks
-// Adds PICOMQTT as an mqtt server on fixed IP (nominally x.x.x.200)
+// Has Serial2 link to hive mqtt bridge.
+// Has a tinyRTC on I2C as a system master clock to synch ESP32 time and serve time synch requests
+// Uses PICOMQTT as an mqtt server on fixed IP (nominally x.x.x.200)
+// Has a basic dns to map mqttid to ip
 // Has topic conventions:
 // - any external topic from Serial2 published locally.
 // - any local topic starting 'mb/f/' sent to Serial2 less the 'mb/f/'
-// - any local topic starting 'mb/t/' is a time synch request
+// - any local topic starting 'mb/s/' is a periodic synch request for time and dns
 // note: mb is the properties mqttid for the broker
-// Has a tinyRTC on I2C as a system master clock to synch ESP32 time and serve time synch requests
-//
+
 // Hive bridge in separate ESP32 to give reliable service
 
 // Not really much to it. All Mqtt client code commented out
 
+
 const char* module = "mqttbroker-1";
 const char* buildDate = __DATE__  "  "  __TIME__;
+
+// issued: sort mqttin / mqttsend in showng zero
 
 // ----------- start properties include 1 --------------------
 #include <SPIFFS.h>
@@ -32,6 +36,9 @@ int bufPtr = 0;
 
 // ----------- start WiFi & Mqtt & Telnet include 1 ---------------------
 #define HAVEWIFI 1
+// sort of a DNS
+#define DNSSIZE 20
+#define SYNCHINTERVAL 30
 // wifi, time, mqtt
 #include <ESP32Time.h>
 ESP32Time rtc;
@@ -41,7 +48,6 @@ ESP32Time rtc;
 #include <PicoMQTT.h>
 ESPTelnet telnet;
 IPAddress ip;
-#define TIMESYNCHINTERVAL 300
 // PicoMQTT::Client mqttClient;  // broker only
 
 // ----------- end  WiFi & Mqtt & Telnet include 1 ---------------------
@@ -69,7 +75,7 @@ String wifiSsid = "<ssid>";
 String wifiSsidN = "wifiSsid";        
 String wifiPwd = "<pwd>";
 String wifiPwdN = "wifiPwd";
-byte wifiIp4 = 240;
+byte wifiIp4 = 0;   // > 0 for fixed ip
 String wifiIp4N = "wifiIp4";
 //byte mqttIp4 = 200;
 //String mqttIp4N = "mqttIp4";
@@ -79,8 +85,8 @@ int telnetPort = 23;
 String telnetPortN = "telnetport";   
 String mqttId = "xx";          // is username-N and token xx/n/.. from unitId
 String mqttIdN = "mqttId";   
-//int unitId  = 9;                  // uniquness of mqtt id
-//String unitIdN = "unitId";
+int unitId  = 9;                  // uniquness of mqtt id
+String unitIdN = "unitId";
 int wdTimeout = 30;
 String wdTimeoutN = "wdTimeout";
 // generic way of setting property as 2 property setting operations
@@ -447,7 +453,7 @@ void extractProps(JsonDocument &doc, bool reportMissing)
   //propName = mqttIp4N;  if (checkProp(doc, propName, reportMissing)) mqttIp4 = doc[propName].as<byte>();
   propName = telnetPortN;if (checkProp(doc, propName, reportMissing)) telnetPort = doc[propName].as<int>();
   propName = mqttIdN;   if (checkProp(doc, propName, reportMissing)) mqttId = doc[propName].as<String>();
-  //propName = unitIdN;   if (checkProp(doc, propName, reportMissing)) unitId = doc[propName].as<int>();
+  propName = unitIdN;   if (checkProp(doc, propName, reportMissing)) unitId = doc[propName].as<int>();
   propName = wdTimeoutN;if (checkProp(doc, propName, reportMissing)) wdTimeout = max(doc[propName].as<int>(),30);
   // these just for adjustment
   propName = restartN; if (checkProp(doc, propName, false)) ESP.restart();
@@ -477,7 +483,7 @@ void addProps(JsonDocument &doc)
   doc[telnetPortN] = telnetPort;
   //doc[mqttPortN] = mqttPort;
   doc[mqttIdN] = mqttId;
-  //doc[unitIdN] = unitId;
+  doc[unitIdN] = unitId;
   doc[wdTimeoutN] = wdTimeout;
 
   // ----- start custom add -----
@@ -497,7 +503,7 @@ void processCommandLine(String cmdLine)
     case 'h':
     case '?':
       log(0, "v:version, w:writeprops, d:dispprops, l:loadprops p<prop>=<val>: change prop, r:restart");
-      log(0, "s:showstats, z:zerostats, 0,1,2:loglevel = " + String(logLevel));
+      log(0, "s:showstats, z:zerostats, n:dns, 0,1,2:loglevel = " + String(logLevel));
       return;
     case 'w':
       writeProps(false);
@@ -533,6 +539,9 @@ void processCommandLine(String cmdLine)
         log(0, "tiny time: " + dateTimeIsoTiny(tinyNow));
         return;
       }
+    case 'n':
+      logDns();
+      break;
     case '0':
       logLevel = 0;
       log(0, " loglevel=" + String(logLevel));
@@ -612,15 +621,22 @@ bool startWifi()
   delay (500);
   unsigned long startWaitWifi = millis();
   WiFi.mode(WIFI_STA);
-  IPAddress subnet(255, 255, 0, 0);
-  IPAddress fixedIp = localIp;
-  fixedIp[3] = wifiIp4;
-  if (!WiFi.config(fixedIp, gatewayIp, subnet, primaryDNSIp, primaryDNSIp)) 
+  if (wifiIp4 == 0)
   {
-    log(1, "STA Failed to configure");
-    return false;
+    log(1, "Start wifi dhcp: " + wifiSsid + " " + wifiPwd);
   }
-  log(1, "Start wifi fixip: " + wifiSsid + " " + wifiPwd);
+  else
+  {
+    IPAddress subnet(255, 255, 0, 0);
+    IPAddress fixedIp = localIp;
+    fixedIp[3] = wifiIp4;
+    if (!WiFi.config(fixedIp, gatewayIp, subnet, primaryDNSIp, primaryDNSIp)) 
+    {
+      log(1, "STA Failed to configure");
+      return false;
+    }
+    log(1, "Start wifi fixip: " + wifiSsid + " " + wifiPwd);
+  }
   WiFi.begin(wifiSsid, wifiPwd);
   return true;
 }
@@ -646,6 +662,131 @@ int waitWifi()
   }
   return 0;
 }
+
+
+// dns support
+struct dnsIsh
+{
+  bool used = false;
+  String name;
+  String ip;
+  int timeout;
+};
+dnsIsh dnsList[DNSSIZE];
+unsigned long dnsVersion = 0;
+unsigned long lastSynchTime = 0;
+
+void logDns()
+{
+  log(0, "dns v=" + String(dnsVersion));
+  for (int ix = 0; ix < DNSSIZE; ix++)
+  {
+    if (dnsList[ix].used && dnsList[ix].timeout > 0)
+    {
+      log(0, String(ix) + " " + dnsList[ix].name + " " + dnsList[ix].ip);
+    }
+  }
+}
+
+String dnsGetIp(String name)
+{
+  for (int ix = 0; ix < DNSSIZE; ix++)
+  {
+    if (dnsList[ix].used && dnsList[ix].name.startsWith(name))
+    {
+      return dnsList[ix].ip;
+    }
+  }
+  return "";
+}
+
+// ESP32 Time
+String formatd2(int i)
+{
+  if (i < 10)
+  {
+    return "0" + String(i);
+  }
+  return String(i);
+}
+String dateTimeIso(tm d)
+{
+  return String(d.tm_year+1900)+"-"+formatd2(d.tm_mon+1)+"-"+formatd2(d.tm_mday)+"T"+formatd2(d.tm_hour)+":"+formatd2(d.tm_min)+":"+formatd2(d.tm_sec);
+}
+
+#if 1
+void synchCheck()
+{
+}
+#else
+// time and dns synch
+void sendSynch()
+{
+  // will get updates if not in synch
+  JsonDocument doc;
+  doc["r"] = mqttMoniker + "/c/s";    // reply token
+  doc["n"] = mqttId + String(unitId);
+  doc["i"] = localIp.toString();
+  doc["e"] = rtc.getEpoch();
+  doc["v"] = dnsVersion;
+  mqttSend("mb/s", doc);
+}
+
+void synchCheck()
+{
+  if (seconds - lastSynchTime > SYNCHINTERVAL/2)
+  {
+    lastSynchTime = seconds;
+    sendSynch();
+  }
+}
+
+void processSynch(JsonDocument &doc)
+{
+  unsigned long epoch = doc["e"].as<unsigned long>();
+  if (epoch > 0)
+  {
+    rtc.setTime(epoch);
+    tm now = rtc.getTimeStruct();
+    log(2, "espTimeSet: " + dateTimeIso(now));
+  }
+  else
+  {
+    int timeAdjust = doc["t"].as<int>();
+    if (timeAdjust != 0)
+    {
+      rtc.setTime(rtc.getEpoch() + timeAdjust);
+      log(2, "espTimeAdjust: " + String(timeAdjust));
+    }
+  }
+  long newDnsVersion = doc["v"].as<long>();
+  if (newDnsVersion != 0)
+  {
+    dnsVersion  = newDnsVersion;
+    log(2, "dns version: " + String(dnsVersion));
+    for (int ix = 0; ix < DNSSIZE; ix++)
+    {
+      dnsList[ix].used = false;
+    }
+    for (int ix = 0; ix < DNSSIZE; ix++)
+    {
+      if (doc.containsKey("n" + String(ix)))
+      {
+        dnsList[ix].name = doc["n" + String(ix)].as<String>();
+        dnsList[ix].ip = doc["i" + String(ix)].as<String>();
+        dnsList[ix].used = true;
+        dnsList[ix].timeout = 1;   // for consistency with dnsLog
+        log(2, ".. " + dnsList[ix].name + " " + dnsList[ix].ip);
+      }
+      else
+      {
+        break;
+      }
+    }
+  }
+}
+#endif
+
 
 
 // ------------- mqtt section -----------------
@@ -674,6 +815,7 @@ void setupMqttClient()
 void mqttConnHandler()
 {
   log(0, "MQTT connected: " + String(millis() - mqttDiscMs));
+  sendSynch();
   mqttConnCount++;
 }
 void mqttDiscHandler()
@@ -713,10 +855,10 @@ void mqttMessageHandler(const char * topicC, Stream & stream)
     // its a property setting
     adjustProp(doc["p"].as<String>());
   }
-  else if (topic.endsWith("/t"))
+  else if (topic.endsWith("/s"))
   {   
-    // its a timeSynch
-    setEspTime(doc);
+    // its a synch response message
+    processSynch(doc);
   }
   else
   {
@@ -744,7 +886,7 @@ void mqttSend(String topic, JsonDocument &doc)
 #endif
 // end mqtt client skipped
 // ------------ telnet --------------
-void setupTelnet() 
+void setupTelnet(int port) 
 {  
   telnet.stop();
   // passing on functions for various telnet events
@@ -754,7 +896,7 @@ void setupTelnet()
   telnet.onReconnect(onTelnetReconnect);
   telnet.onInputReceived(onTelnetInput);
 
-  if (telnet.begin(telnetPort)) 
+  if (telnet.begin(port)) 
   {
     log(1, "telnet running");
   } 
@@ -790,36 +932,7 @@ void onTelnetInput(String str)
 {
   processCommandLine(str);
 }
-// ESP32 Time
-int timeSynchIntervalAct = 5;    // initially 5 sec, then TIMESYNCHINTERVAL
-unsigned long lastTimeSynch;
 
-String formatd2(int i)
-{
-  if (i < 10)
-  {
-    return "0" + String(i);
-  }
-  return String(i);
-}
-String dateTimeIso(tm d)
-{
-  return String(d.tm_year+1900)+"-"+formatd2(d.tm_mon+1)+"-"+formatd2(d.tm_mday)+"T"+formatd2(d.tm_hour)+":"+formatd2(d.tm_min)+":"+formatd2(d.tm_sec);
-}
-
-void setEspTime(JsonDocument &doc)
-{
-  rtc.setTime(doc["se"].as<int>(), doc["mi"].as<int>(), doc["hr"].as<int>(), doc["dy"].as<int>(), doc["mn"].as<int>(), doc["yr"].as<int>());
-  tm now = rtc.getTimeStruct();
-  log(2, "esp time synch:" + dateTimeIso(now));
-  timeSynchIntervalAct = TIMESYNCHINTERVAL;
-}
-void requestTimeSynch()
-{
-  JsonDocument doc;
-  doc["topic"] = mqttMoniker + "/c/t";
-  mqttSend("mb/t", doc);
-}
 void setRetryDelay()
 {
   startRetryDelay = seconds;
@@ -842,11 +955,7 @@ void checkState()
     seconds++;
     lastSecondMs+= 1000;
   }
-  //if (seconds - lastTimeSynch > timeSynchIntervalAct)
-  //{
-  //  lastTimeSynch = seconds;
-  //  requestTimeSynch();
-  //}
+  synchCheck();
   bool thisWifiState = WiFi.isConnected();
   if (thisWifiState != lastWifiState)
   {
@@ -861,7 +970,6 @@ void checkState()
     }
     lastWifiState = thisWifiState;
   }
- 
  
   if (retryDelay)
   {
@@ -879,10 +987,17 @@ void checkState()
   switch (state)
   {
     case START:
-      state = STARTGETGATEWAY;
+      if (wifiIp4 == 0)
+      {
+        state = STARTCONNECTWIFI;    // dhcp ip
+      }
+      else
+      {
+        state = STARTGETGATEWAY;
+      }
       return;
     case STARTGETGATEWAY:
-      // mandatory we get gateway info before proceeding
+      // only get gateway for fixed ip
       if (!startGetGateway())
       {
         setRetryDelay();
@@ -923,7 +1038,7 @@ void checkState()
         state = STARTCONNECTWIFI;
         return;
       }
-      setupTelnet();
+      setupTelnet(telnetPort);
       //setupMqttClient();   // dont use client
       setupBroker();
       state = ALLOK;
@@ -937,14 +1052,12 @@ void checkState()
 // ------------ end wifi and mqtt include section 2 ---------------
 
 // ------------ start wifi and mqtt custom section 2 ---------------
-// start mqtt custom skipped
-#if 0
+
 void mqttSubscribeAdd()
 {
   // use standard or custom handler
   // start subscribe add
-  String topic = "other/#";
-  mqttClient.subscribe(topic, &mqttMessageHandler);
+  
   // end subscribe add
 }
 void handleIncoming(String topic, JsonDocument &doc)
@@ -953,8 +1066,7 @@ void handleIncoming(String topic, JsonDocument &doc)
   
   // end custom additional incoming
 }
-#endif
-// end mqtt custom skipped
+
 // ------------ end wifi and mqtt custom section 2 ---------------
 
 // ---- start custom code --------------
@@ -989,29 +1101,185 @@ void setTinyRtc(int val, String propName)
   espTimeSynch();
 }
 
-void getTinyTime(JsonDocument &doc)
+void espTimeSynch()
 { 
   DateTime tinyNow = tinyrtc.now();
-  doc["yr"] = tinyNow.year();
-  doc["mn"] = tinyNow.month();
-  doc["dy"] = tinyNow.day();
-  doc["hr"] = tinyNow.hour();
-  doc["mi"] = tinyNow.minute();
-  doc["se"] = tinyNow.second();
+  rtc.setTime(tinyNow.second(),tinyNow.minute(),tinyNow.hour(),tinyNow.day(),tinyNow.month(),tinyNow.year());
 }
 
-void espTimeSynch()
+// dns manager - broker only
+
+unsigned long lastDnsJanitor = 0;
+
+void dnsJanitor()
 {
-  JsonDocument doc;
-  getTinyTime(doc);
-  setEspTime(doc);
+  if (seconds - lastDnsJanitor > 0)
+  {
+    lastDnsJanitor = seconds;
+    for (int ix = 0; ix < DNSSIZE; ix++)
+    {
+      if (dnsList[ix].timeout > 0)
+      {
+        dnsList[ix].timeout--;
+        if (dnsList[ix].timeout == 0 && logLevel >=2)
+        {
+          log(2, "drop dns[" + String(ix) + "]: " + dnsList[ix].name + " " + dnsList[ix].ip);
+          dnsVersion++; 
+        }
+      }
+    }
+  }
+}
+void registerDns(String name, String ip)
+{
+  for (int ix = 0; ix < DNSSIZE; ix++)
+  {
+    if (dnsList[ix].used && dnsList[ix].name == name)
+    {
+      dnsList[ix].timeout = SYNCHINTERVAL+60;
+      if (dnsList[ix].ip != ip)
+      {
+        dnsList[ix].ip = ip;
+      }
+      return;
+    }
+  }
+  for (int ix = 0; ix < DNSSIZE; ix++)
+  {
+    if (!dnsList[ix].used)
+    {
+      dnsList[ix].used = true;
+      dnsList[ix].timeout = SYNCHINTERVAL+60;
+      dnsList[ix].ip = ip;
+      dnsList[ix].name = name;
+      if (logLevel >=2)
+      {
+        log(2, "add dns[" + String(ix) + "]: " + dnsList[ix].name + " " + dnsList[ix].ip);
+      }
+      dnsVersion++;
+      return;
+    }
+  }
+  log(0, "! no room in dns list!");
+}
+
+void selfRegister()
+{
+  registerDns(mqttId + String(unitId), localIp.toString());
+}
+
+
+
+void processSynchServer(JsonDocument &doc, bool toSerial)
+{
+  String name = doc["n"].as<String>();
+  String ip = doc["i"].as<String>();
+  registerDns(name, ip);
+  unsigned long clientEpoch = doc["e"].as<unsigned long>();
+  unsigned long espEpoch = rtc.getEpoch();
+  int timeDiff = 0;
+  int timeAdjust = 0;
+  unsigned long epochReset = 0;
+  bool sendUpdate = false;
+  if (clientEpoch > espEpoch)
+  {
+    timeDiff = clientEpoch - espEpoch;
+    if (timeDiff > 2)
+    {
+      timeAdjust = -1;
+      sendUpdate = true;
+    }
+  }
+  else if (espEpoch > clientEpoch)
+  {
+    timeDiff = espEpoch - clientEpoch;
+    if (timeDiff > 2)
+    {
+      timeAdjust = 1;
+      sendUpdate = true;
+    }
+  }
+  if (timeDiff > 20)
+  {
+    timeAdjust = 0;
+    epochReset = espEpoch;
+    sendUpdate = true;
+  }
+  unsigned long clientDnsVersion = doc["v"].as<unsigned long>();
+  if (clientDnsVersion != dnsVersion)
+  {
+    sendUpdate = true;
+  }
+  if (!sendUpdate)
+  {
+    return;    // nowt to do
+  }
+  String replyTo = doc["r"].as<String>();
+  doc.clear();
+  doc["e"] = epochReset;
+  doc["t"] = timeAdjust;
+  if (clientDnsVersion == dnsVersion)
+  {
+    doc["v"] = 0;
+  }
+  else
+  {
+    int count = 0;
+    for (int ix = 0; ix < DNSSIZE; ix++)
+    {
+      if (dnsList[ix].used && dnsList[ix].timeout > 0)
+      {
+        doc["n" + String(count)] = dnsList[ix].name;
+        doc["i" + String(count)] = dnsList[ix].ip;
+        count++;
+      }
+    }
+    doc["v"] = dnsVersion;
+  }
+  if (toSerial)
+  {
+    serial2Send(replyTo, doc);
+  }
+  else
+  {
+    brokerSend(replyTo, doc);
+  }
+}
+
+// broker
+void brokerSend(String topic, JsonDocument doc)
+{
+  // publish using begin_publish()/send() API
+  auto publish = mqttBroker.begin_publish(topic, measureJson(doc));
+  serializeJson(doc, publish);
+  publish.send();
+  if (logLevel >=2)
+  {
+    String s;
+    serializeJson(doc, s);
+    log(2, "broker out: " + topic + " " + s); 
+  }
+  mqttSendCount++;
+}
+
+void serial2Send(String topic, JsonDocument doc)
+{
+  Serial2.print(topic);
+  serializeJson(doc, Serial2);
+  Serial2.print(char(0));
+  if (logLevel >=2)
+  {
+    String s;
+    serializeJson(doc, s);
+    log(2, "to bridge: " + topic + " " + s); 
+  }
 }
 
 void setupBroker()
 {
   tinyrtc.begin();
   espTimeSynch();
-
+  selfRegister();
   mqttBroker.begin();
   mqttBroker.subscribe(mqttId + "/#", &brokerCallback);
   log(1, "mqttBroker started");
@@ -1036,27 +1304,13 @@ void brokerCallback(const char * topic, const char * message)
     Serial2.print(char(0));
     return;
   }
-  if (topicS.startsWith(mqttId + "/t"))
+  else if (topicS == mqttId + "/s"))
   {
-    // time synch request - return address in message
-    {
-      JsonDocument doc;
-      deserializeJson(doc, message);
-      String replyTo = doc["topic"].as<String>();
-      doc.clear();
-      getTinyTime(doc);
-      // publish using begin_publish()/send() API
-      auto publish = mqttBroker.begin_publish(replyTo, measureJson(doc));
-      serializeJson(doc, publish);
-      publish.send();
-      if (logLevel >=2)
-        {
-          log(2, "timesynch: " + replyTo); 
-        }
-      mqttSendCount++;
-    }
+    JsonDocument doc;
+    deserializeJson(doc, message);
+    processSynchServer(doc, false);
   }
-
+ 
 }
 
 // Serial 2 input handling
@@ -1068,15 +1322,16 @@ int tbPtr = 0;
 char mb[MBLEN];    // for message
 int mbPtr = 0;
 
-unsigned long lastTimesynch;
-
 void brokerLoop()
 {
-  if (seconds - lastTimesynch > TIMESYNCHINTERVAL)
+  if (seconds - lastSynchTime > SYNCHINTERVAL)
   {
-    lastTimesynch = seconds;
+    lastSynchTime = seconds;
     espTimeSynch();
+    selfRegister();
   }
+
+  dnsJanitor();
 
   mqttBroker.loop();
 
@@ -1111,11 +1366,22 @@ void brokerLoop()
         topicBit = true;
         mbPtr = 0;
         tbPtr = 0;
-        mqttBroker.publish(tb, mb);
-        mqttSendCount++;
+        String topic = String(tb);
+         if (topic == mqttId + "/s")
+        {
+          // intercept synch from bridge
+          JsonDocument doc;
+          deserializeJson (doc, mb);
+          processSynchServer(doc, true);
+        }
+        else
+        {
+          mqttBroker.publish(tb, mb);
+          mqttSendCount++;
+        }
         if (logLevel >=2)
         {
-          log(2, "from bridge: " + String(tb) + " " + String(mb)); 
+          log(2, "from bridge: " + topic + " " + String(mb)); 
         }
       }
       else
